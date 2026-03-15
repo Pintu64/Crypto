@@ -1,0 +1,696 @@
+#!/usr/bin/env python3
+import os
+import html
+import logging
+import threading
+import time
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+import requests
+import sqlite3
+import telebot
+
+# ========================= CONFIG =========================
+BOT_TOKEN = '8628303607:AAENP1z9yg-a3JraILPUTrHX1VHrD87toWA'
+HELIUS_KEY = '0d8d6036-c502-4b71-a012-c8ada9b7bf9f'
+
+if not BOT_TOKEN or not HELIUS_KEY:
+    raise RuntimeError("BOT_TOKEN and HELIUS_KEY must be provided via environment variables")
+
+HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
+COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
+
+DB_FILE = "sol_tracker.db"
+POLL_INTERVAL = 10  # seconds
+# ========================================================
+
+# Basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Telegram bot
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode='HTML')
+
+# Requests session
+session = requests.Session()
+session.headers.update({"User-Agent": "SolTracker/1.0"})
+
+# Common token mint -> symbol map for fast resolution (add frequently used tokens here)
+COMMON_TOKENS: Dict[str, str] = {
+    # USDC (Serum / most common)
+    "Es9vMFrzaCER4zJYc1r6k3oM7a7xRkK1tJ7s5q3y8k5r": "USDC",
+    # USDT (example mint; replace/augment with actual known mints you track)
+    "BXXkv6z4kZ8r4G9j5B5yF1h9Fk3o2mQ5u6w8y1z5a6x9": "USDT",
+    # Example tokens - add real mints you care about
+    # The real USDC mint on mainnet is: "Es9vMFrzaCER4zJYc1r6k3oM7a7xRkK1tJ7s5q3y8k5r"
+    # (Make sure to include the correct mints for best results)
+}
+# Note: Add / replace entries above with canonical mint addresses you expect in your flows.
+
+# ========================= Database helpers =========================
+def get_db_connection():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    return conn
+
+def init_db():
+    conn = get_db_connection()
+    c = conn.cursor()
+    # watched: (user_id, address) unique
+    c.execute('''CREATE TABLE IF NOT EXISTS watched 
+                 (user_id INTEGER, address TEXT, last_signature TEXT, nickname TEXT DEFAULT NULL, PRIMARY KEY(user_id, address))''')
+    # token_meta caches mint -> symbol/name/decimals
+    c.execute('''CREATE TABLE IF NOT EXISTS token_meta
+                 (mint TEXT PRIMARY KEY, symbol TEXT, name TEXT, decimals INTEGER, fetched_at INTEGER)''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ========================= Utilities =========================
+def escape_html(text: str) -> str:
+    return html.escape(str(text), quote=False)
+
+def get_live_sol_price() -> float:
+    try:
+        r = session.get(COINGECKO_URL, timeout=5)
+        if r.status_code == 200:
+            return float(r.json().get("solana", {}).get("usd", 175.0))
+    except Exception as e:
+        logging.debug(f"Coingecko error: {e}")
+    return 175.0
+
+def rpc_post(method: str, params: list):
+    try:
+        r = session.post(HELIUS_RPC, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=12)
+        r.raise_for_status()
+        return r.json().get("result")
+    except Exception as e:
+        logging.error(f"Helius error {method}: {e}")
+        return None
+
+# ========================= DB operations for watches =========================
+def db_get_watched(user_id: int) -> List[Dict]:
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT address, last_signature, nickname FROM watched WHERE user_id=?", (user_id,))
+    rows = [{"address": r[0], "last_sig": r[1], "nickname": r[2]} for r in c.fetchall()]
+    conn.close()
+    return rows
+
+def db_add_watch(user_id: int, address: str, nickname: str = None):
+    sigs = rpc_post("getSignaturesForAddress", [address, {"limit": 1}])
+    last_sig = sigs[0]["signature"] if sigs and isinstance(sigs, list) and len(sigs) > 0 else None
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO watched (user_id, address, last_signature, nickname) VALUES (?, ?, ?, ?)",
+              (user_id, address, last_sig, nickname))
+    conn.commit()
+    conn.close()
+
+def db_set_nickname(user_id: int, address: str, nickname: str):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("UPDATE watched SET nickname=? WHERE user_id=? AND address=?", (nickname, user_id, address))
+    conn.commit()
+    conn.close()
+
+def db_remove_watch(user_id: int, address: str):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("DELETE FROM watched WHERE user_id=? AND address=?", (user_id, address))
+    conn.commit()
+    conn.close()
+
+def db_update_last_sig(user_id: int, address: str, sig: str):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("UPDATE watched SET last_signature=? WHERE user_id=? AND address=?", (sig, user_id, address))
+    conn.commit()
+    conn.close()
+
+# ========================= Token symbol resolution & caching =========================
+def db_get_token_symbol(mint: str) -> Optional[str]:
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT symbol FROM token_meta WHERE mint=?", (mint,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return row[0]
+    return None
+
+def db_set_token_meta(mint: str, symbol: Optional[str], name: Optional[str] = None, decimals: Optional[int] = None):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO token_meta (mint, symbol, name, decimals, fetched_at) VALUES (?, ?, ?, ?, ?)",
+              (mint, symbol, name, decimals or 0, int(time.time())))
+    conn.commit()
+    conn.close()
+
+def short_mint(mint: str) -> str:
+    return f"{mint[:6]}...{mint[-4:]}"
+
+def resolve_token_symbol(mint: str) -> str:
+    """
+    Resolve the symbol for a token mint:
+      1) Check in-memory COMMON_TOKENS
+      2) Check DB cache (token_meta)
+      3) Try Helius RPC 'getTokenMetadata' (best-effort)
+      4) Fallback to short mint string
+    Caches any found symbol to DB.
+    """
+    if not mint:
+        return "Token"
+
+    # 1) in-memory common map
+    if mint in COMMON_TOKENS:
+        sym = COMMON_TOKENS[mint]
+        db_set_token_meta(mint, sym)
+        return sym
+
+    # 2) DB cache
+    sym = db_get_token_symbol(mint)
+    if sym:
+        return sym
+
+    # 3) Try Helius token metadata method (best-effort)
+    try:
+        # Helius provides methods for token metadata on many deployments; if your plan supports it, this will return useful info.
+        res = rpc_post("getTokenMetadata", [mint])
+        if isinstance(res, dict):
+            sym = res.get("symbol") or res.get("name") or None
+            name = res.get("name")
+            decimals = res.get("decimals") if isinstance(res.get("decimals"), int) else None
+            if sym:
+                db_set_token_meta(mint, sym, name=name, decimals=decimals)
+                return sym
+    except Exception as e:
+        logging.debug(f"Token metadata RPC failed for {mint}: {e}")
+
+    # 4) fallback: save short mint to DB (so we won't re-query repeatedly)
+    fallback = short_mint(mint)
+    db_set_token_meta(mint, fallback)
+    return fallback
+
+# ========================= Transaction parsing helpers =========================
+def get_new_transactions(addr: str, last_sig: Optional[str]):
+    """
+    Fetch recent signatures and return only those that are NEWER than last_sig.
+    We fetch newest->oldest; return only signatures strictly newer than last_sig.
+    """
+    fetched = rpc_post("getSignaturesForAddress", [addr, {"limit": 50}]) or []
+    if not isinstance(fetched, list) or len(fetched) == 0:
+        return []
+
+    if not last_sig:
+        return fetched
+
+    # Find index of last_sig; return entries before it (newer)
+    for idx, item in enumerate(fetched):
+        if item.get("signature") == last_sig:
+            return fetched[:idx]
+    # last_sig not found: return fetched (we may have missed many)
+    return fetched
+
+def get_token_and_sol_changes_for_address(tx: dict, watched_addr: str) -> Tuple[List[Dict], float]:
+    """
+    Returns:
+      - token_changes: list of dicts { 'mint': str, 'change': float } (change >0 => received, <0 => sent)
+      - sol_change: float (native SOL change in SOL, positive => received, negative => sent)
+    """
+    token_changes: List[Dict] = []
+    sol_change = 0.0
+    try:
+        meta = tx.get("meta", {}) or {}
+        message = tx.get("transaction", {}).get("message", {}) or {}
+        raw_keys = message.get("accountKeys") or message.get("accountKeys", []) or []
+        accounts = []
+        for k in raw_keys:
+            if isinstance(k, dict):
+                accounts.append(k.get("pubkey"))
+            else:
+                accounts.append(k)
+
+        # Native SOL change
+        pre_balances = meta.get("preBalances") or []
+        post_balances = meta.get("postBalances") or []
+        if accounts and watched_addr in accounts:
+            idx = accounts.index(watched_addr)
+            if idx < len(pre_balances) and idx < len(post_balances):
+                lam_pre = pre_balances[idx] or 0
+                lam_post = post_balances[idx] or 0
+                sol_change = (lam_post - lam_pre) / 1e9
+
+        # SPL token changes
+        pre_tokens = meta.get("preTokenBalances") or []
+        post_tokens = meta.get("postTokenBalances") or []
+
+        def build_map(entries):
+            m = {}
+            for e in entries:
+                mint = e.get("mint")
+                acct_idx = e.get("accountIndex")
+                owner = e.get("owner")
+                try:
+                    amt = float(e.get("uiTokenAmount", {}).get("uiAmount") or 0)
+                except Exception:
+                    try:
+                        amt = float(e.get("uiTokenAmount", {}).get("uiAmountString") or 0)
+                    except Exception:
+                        amt = 0.0
+                key = (mint, acct_idx, owner)
+                m[key] = {"amt": amt, "raw": e}
+            return m
+
+        pre_map = build_map(pre_tokens)
+        post_map = build_map(post_tokens)
+
+        def find_pre_amount(mint, acct_idx, owner):
+            # try exact match
+            if (mint, acct_idx, owner) in pre_map:
+                return pre_map[(mint, acct_idx, owner)]["amt"]
+            # by owner
+            for (m, ai, ow), val in pre_map.items():
+                if m == mint and owner and ow == owner:
+                    return val["amt"]
+            # by accountIndex
+            if acct_idx is not None:
+                for (m, ai, ow), val in pre_map.items():
+                    if m == mint and ai == acct_idx:
+                        return val["amt"]
+            # any pre with same mint
+            for (m, ai, ow), val in pre_map.items():
+                if m == mint:
+                    return val["amt"]
+            return 0.0
+
+        # compute deltas for post entries
+        for (mint, acct_idx, owner), post_val in post_map.items():
+            post_amt = post_val["amt"]
+            pre_amt = find_pre_amount(mint, acct_idx, owner)
+            delta = post_amt - pre_amt
+            if abs(delta) < 1e-12:
+                continue
+            # determine if this post entry belongs to watched_addr
+            maps_to_watched = False
+            if owner and owner == watched_addr:
+                maps_to_watched = True
+            elif acct_idx is not None and acct_idx < len(accounts) and accounts[acct_idx] == watched_addr:
+                maps_to_watched = True
+            else:
+                for (pmint, pai, powr), pval in pre_map.items():
+                    if pmint == mint and powr == watched_addr:
+                        maps_to_watched = True
+                        break
+            if maps_to_watched:
+                token_changes.append({"mint": mint, "change": delta})
+
+        # handle pre entries missing in post (e.g. burns)
+        for (mint, acct_idx, owner), pre_val in pre_map.items():
+            if (mint, acct_idx, owner) not in post_map:
+                pre_amt = pre_val["amt"]
+                post_amt = 0.0
+                delta = post_amt - pre_amt
+                if abs(delta) < 1e-12:
+                    continue
+                maps_to_watched = False
+                if owner and owner == watched_addr:
+                    maps_to_watched = True
+                elif acct_idx is not None and acct_idx < len(accounts) and accounts[acct_idx] == watched_addr:
+                    maps_to_watched = True
+                if maps_to_watched:
+                    token_changes.append({"mint": mint, "change": delta})
+    except Exception as e:
+        logging.debug(f"get_token_and_sol_changes error: {e}")
+
+    return token_changes, sol_change
+
+# ========================= Detection / Alerting =========================
+def detect_activity_fallback(tx_info: dict, watched_addr: str) -> str:
+    tx_str = str(tx_info).lower()
+    if any(word in tx_str for word in ["jupiter", "swap", "raydium", "orca"]):
+        return "Swap Executed"
+    if any(word in tx_str for word in ["bridge", "wormhole", "portal"]):
+        return "Bridged"
+    if "stake" in tx_str:
+        return "Staked"
+    if "unstake" in tx_str:
+        return "Unstaked"
+    if "mint" in tx_str:
+        return "Minted"
+    return "Unknown Activity"
+
+def send_premium_alert(uid: int, wallet_addr: str, nickname: Optional[str], sig: str):
+    display_name = nickname or f"{wallet_addr[:6]}...{wallet_addr[-4:]}"
+    sol_price = get_live_sol_price()
+
+    tx = rpc_post("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
+    if not isinstance(tx, dict):
+        tx = {}
+
+    token_changes, sol_change = get_token_and_sol_changes_for_address(tx, wallet_addr)
+
+    details_parts = []
+    action = "Unknown Activity"
+
+    # Format token changes using resolved symbols
+    if token_changes:
+        any_recv = False
+        any_sent = False
+        for tc in token_changes:
+            mint = tc.get("mint") or ""
+            change = tc.get("change") or 0.0
+            sym = resolve_token_symbol(mint)
+            sign = "+" if change > 0 else ""
+            # use 6 decimals for token display (uiAmount is already normalized using decimals in RPC)
+            details_parts.append(f"{sign}{change:,.6f} {sym}")
+            if change > 0:
+                any_recv = True
+            if change < 0:
+                any_sent = True
+        if any_recv and not any_sent:
+            action = "Received"
+        elif any_sent and not any_recv:
+            action = "Sent"
+        else:
+            action = "Mixed Token Activity"
+
+    # Native SOL change
+    if abs(sol_change) >= 1e-12:
+        sign = "+" if sol_change > 0 else ""
+        details_parts.append(f"{sign}{sol_change:,.9f} SOL")
+        if action == "Unknown Activity":
+            action = "Received" if sol_change > 0 else "Sent"
+        elif action == "Mixed Token Activity":
+            pass
+
+    # Fallback: attempt to use textual heuristics if still unknown
+    if action == "Unknown Activity":
+        action = detect_activity_fallback(tx, wallet_addr)
+
+    details = ", ".join(details_parts) if details_parts else "—"
+
+    ts = datetime.utcfromtimestamp(tx.get("blockTime", time.time())).strftime('%Y-%m-%d %H:%M UTC')
+    wallet_html = escape_html(display_name)
+    action_html = escape_html(action)
+    details_html = escape_html(details)
+    price_html = escape_html(f"${sol_price:,.2f}")
+    time_html = escape_html(ts)
+    tx_link = f'<a href="https://solscan.io/tx/{escape_html(sig)}"><code>{escape_html(sig[:8] + "..." + sig[-6:])}</code></a>'
+
+    caption = (
+        f"🚨 <b>New Transaction Detected</b>\n\n"
+        f"👛 <b>Wallet</b>: {wallet_html}\n\n"
+        f"🔥 <b>Action</b>: {action_html}\n"
+        f"💰 <b>Amount</b>: {details_html}\n\n"
+        f"📊 <b>SOL Price</b>: {price_html}\n"
+        f"⏰ <b>Time</b>: {time_html}\n\n"
+        f"🔗 <b>Transaction</b>: {tx_link}"
+    )
+
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("🔎 View on Solscan", url=f"https://solscan.io/tx/{sig}"))
+
+    try:
+        bot.send_message(uid, caption, reply_markup=markup, disable_web_page_preview=True)
+    except Exception as e:
+        logging.error(f"Alert failed for uid={uid}: {e}")
+        try:
+            bot.send_message(uid, f"🔔 New activity on {wallet_html}\nTx: {escape_html(sig[:12] + '...')}", disable_web_page_preview=True)
+        except Exception as e2:
+            logging.error(f"Fallback alert failed: {e2}")
+
+# ========================= History / Quick-check helpers =========================
+def get_history_text(addr: str, limit: int = 10) -> str:
+    sigs = rpc_post("getSignaturesForAddress", [addr, {"limit": limit}]) or []
+    if not isinstance(sigs, list) or len(sigs) == 0:
+        return "No recent transactions found for this address."
+
+    lines = []
+    for s in sigs:
+        sig = s.get("signature")
+        if not sig:
+            continue
+        tx = rpc_post("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]) or {}
+        token_changes, sol_change = get_token_and_sol_changes_for_address(tx, addr)
+        details = []
+        for tc in token_changes:
+            mint = tc.get("mint")
+            change = tc.get("change")
+            sym = resolve_token_symbol(mint)
+            sign = "+" if change > 0 else ""
+            details.append(f"{sign}{change:,.6f} {sym}")
+        if abs(sol_change) >= 1e-12:
+            sign = "+" if sol_change > 0 else ""
+            details.append(f"{sign}{sol_change:,.9f} SOL")
+        detail_txt = ", ".join(details) if details else "—"
+        action = detect_activity_fallback(tx, addr) if detail_txt == "—" else ("Received" if any(('+' in d) for d in details) else "Sent")
+        ts = "-"
+        if isinstance(tx.get("blockTime"), (int, float)):
+            ts = datetime.utcfromtimestamp(tx.get("blockTime")).strftime('%Y-%m-%d %H:%M UTC')
+        link = f'<a href="https://solscan.io/tx/{escape_html(sig)}"><code>{escape_html(sig[:8] + "..." + sig[-6:])}</code></a>'
+        lines.append(f"• <b>{escape_html(action)}</b> — {escape_html(detail_txt)} — {escape_html(ts)} — {link}")
+
+    return "\n".join(lines) if lines else "No recent transactions found."
+
+# ========================= Watcher thread =========================
+def watcher_thread():
+    logging.info("Watcher thread started")
+    while True:
+        try:
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute("SELECT user_id, address, last_signature, nickname FROM watched")
+            rows = c.fetchall()
+            conn.close()
+
+            for row in rows:
+                uid, addr, last_sig, nick = row
+                try:
+                    new_txs = get_new_transactions(addr, last_sig)
+                    if not new_txs:
+                        continue
+
+                    # Process oldest-first
+                    for tx_info in reversed(new_txs):
+                        sig = tx_info.get("signature")
+                        if not sig:
+                            continue
+                        # don't alert for the stored last_sig (defensive)
+                        if last_sig and sig == last_sig:
+                            continue
+                        # Fetch transaction to analyze before sending alert
+                        tx_full = rpc_post("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]) or {}
+                        token_changes, sol_change = get_token_and_sol_changes_for_address(tx_full, addr)
+                        # Only alert if there's any change (token or SOL) or if fallback heuristics show activity
+                        if token_changes or abs(sol_change) >= 1e-12:
+                            send_premium_alert(uid, addr, nick or None, sig)
+                        else:
+                            # fallback: use heuristics
+                            act = detect_activity_fallback(tx_full, addr)
+                            if act != "Unknown Activity":
+                                send_premium_alert(uid, addr, nick or None, sig)
+
+                    # Update last_signature to the newest seen to avoid repeats
+                    if isinstance(new_txs, list) and len(new_txs) > 0:
+                        newest_sig = new_txs[0].get("signature")
+                        if newest_sig:
+                            db_update_last_sig(uid, addr, newest_sig)
+                except Exception as inner_e:
+                    logging.error(f"Error processing wallet {addr}: {inner_e}")
+        except Exception as e:
+            logging.error(f"Watcher error: {e}")
+        time.sleep(POLL_INTERVAL)
+
+# ========================= Telegram UI and handlers =========================
+user_states: Dict[int, str] = {}
+
+def main_menu_keyboard():
+    kb = telebot.types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        telebot.types.InlineKeyboardButton("💼 My Wallets          📈", callback_data="menu_watchlist"),
+        telebot.types.InlineKeyboardButton("➕ Add New Wallet     🚀", callback_data="menu_add"),
+        telebot.types.InlineKeyboardButton("🔍 Quick Check       💰", callback_data="menu_lookup"),
+        telebot.types.InlineKeyboardButton("📊 Full History      📜", callback_data="menu_history"),
+        telebot.types.InlineKeyboardButton("ℹ️  Help & Tips       ✨", callback_data="menu_help")
+    )
+    return kb
+
+def wallet_actions_kb(addr: str):
+    kb = telebot.types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        telebot.types.InlineKeyboardButton("📊 Balance & Tokens", callback_data=f"det:{addr}"),
+        telebot.types.InlineKeyboardButton("📜 History", callback_data=f"his:{addr}:0"),
+    )
+    kb.add(
+        telebot.types.InlineKeyboardButton("✏️ Set Name", callback_data=f"setname:{addr}"),
+        telebot.types.InlineKeyboardButton("🗑️ Remove", callback_data=f"rm:{addr}"),
+    )
+    kb.add(telebot.types.InlineKeyboardButton("🏠 Home", callback_data="main_menu"))
+    return kb
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    bot.answer_callback_query(call.id)
+    data = call.data
+    uid = call.from_user.id
+    cid = call.message.chat.id
+
+    if data == "main_menu":
+        bot.send_message(cid, "✨ Solana Tracker Pro ✨\nChoose action 👇", reply_markup=main_menu_keyboard())
+
+    elif data == "menu_watchlist":
+        wallets = db_get_watched(uid)
+        if not wallets:
+            bot.send_message(cid, "📭 No wallets yet\nAdd one!", reply_markup=main_menu_keyboard())
+            return
+        kb = telebot.types.InlineKeyboardMarkup(row_width=1)
+        for w in wallets:
+            short = w["nickname"] or f"{w['address'][:5]}…{w['address'][-4:]}"
+            kb.add(telebot.types.InlineKeyboardButton(f"💎 {escape_html(short)}", callback_data=f"sel:{w['address']}"))
+        kb.add(telebot.types.InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu"))
+        bot.send_message(cid, "💼 Your Wallets", reply_markup=kb)
+
+    elif data == "menu_add":
+        user_states[uid] = "add_wallet"
+        kb = telebot.types.InlineKeyboardMarkup().add(telebot.types.InlineKeyboardButton("🏠 Cancel", callback_data="main_menu"))
+        bot.send_message(cid, "📨 Paste Solana address:", reply_markup=kb)
+
+    elif data == "menu_lookup":
+        user_states[uid] = "quick_lookup"
+        kb = telebot.types.InlineKeyboardMarkup().add(telebot.types.InlineKeyboardButton("🏠 Cancel", callback_data="main_menu"))
+        bot.send_message(cid, "🔍 Quick Check\nPaste a Solana address (44-char base58):", reply_markup=kb)
+
+    elif data == "menu_history":
+        user_states[uid] = "get_history"
+        kb = telebot.types.InlineKeyboardMarkup().add(telebot.types.InlineKeyboardButton("🏠 Cancel", callback_data="main_menu"))
+        bot.send_message(cid, "📜 Full History\nPaste a Solana address to fetch recent transactions:", reply_markup=kb)
+
+    elif data.startswith("setname:"):
+        addr = data[8:]
+        user_states[uid] = f"set_nick:{addr}"
+        bot.send_message(cid, f"✏️ Send new name for wallet <code>{escape_html(addr[:6] + '...' + addr[-4:])}</code>:")
+
+    elif data.startswith("sel:"):
+        addr = data[4:]
+        bot.send_message(cid, "💎 Wallet selected\nWhat next?", reply_markup=wallet_actions_kb(addr))
+
+    elif data.startswith("det:"):
+        addr = data[4:]
+        sol_bal = rpc_post("getBalance", [addr])
+        sol_val = sol_bal["value"] / 1e9 if isinstance(sol_bal, dict) and "value" in sol_bal else 0.0
+        tokens_text = get_token_holdings(addr)
+        text = (
+            f"<b>Wallet Balance</b>\n"
+            f"• SOL: <b>{escape_html(f'{sol_val:.6f}')}</b>\n\n"
+            f"<b>Tokens & NFTs</b>\n{tokens_text}"
+        )
+        bot.send_message(cid, text, reply_markup=wallet_actions_kb(addr))
+
+    elif data.startswith("his:"):
+        addr = data[4:].split(":")[0]
+        bot.send_chat_action(cid, 'typing')
+        history_text = get_history_text(addr, limit=10)
+        bot.send_message(cid, f"Recent history for <code>{escape_html(addr[:6] + '...' + addr[-4:])}</code>:\n\n{history_text}", reply_markup=wallet_actions_kb(addr), disable_web_page_preview=True)
+
+    elif data.startswith("rm:"):
+        addr = data[3:]
+        db_remove_watch(uid, addr)
+        bot.send_message(cid, f"🗑️ Removed wallet <code>{escape_html(addr[:6] + '...' + addr[-4:])}</code>", reply_markup=main_menu_keyboard())
+
+@bot.message_handler(commands=['start', 'wallet', 'menu'])
+def start_cmd(msg):
+    bot.send_message(msg.chat.id, "✨ Solana Tracker Pro ✨\nChoose action 👇", reply_markup=main_menu_keyboard())
+
+def is_valid_solana_address(s: str) -> bool:
+    return len(s) == 44 and all(c in '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz' for c in s)
+
+@bot.message_handler(func=lambda m: True)
+def text_handler(msg):
+    uid = msg.from_user.id
+    txt = (msg.text or "").strip()
+    state = user_states.get(uid)
+
+    if state and state.startswith("set_nick:"):
+        addr = state.split(":", 1)[1]
+        db_set_nickname(uid, addr, txt.strip())
+        bot.reply_to(msg, "✅ Name updated!")
+        user_states.pop(uid, None)
+        return
+
+    if state == "add_wallet":
+        if is_valid_solana_address(txt):
+            db_add_watch(uid, txt)
+            bot.reply_to(msg, "🎉 Wallet added!\nAlerts enabled 🚨", reply_markup=wallet_actions_kb(txt))
+        else:
+            bot.reply_to(msg, "Invalid Solana address. Send 44-char base58.")
+        user_states.pop(uid, None)
+        return
+
+    if state == "quick_lookup":
+        if is_valid_solana_address(txt):
+            sol_bal = rpc_post("getBalance", [txt])
+            sol_val = sol_bal["value"] / 1e9 if isinstance(sol_bal, dict) and "value" in sol_bal else 0.0
+            tokens_text = get_token_holdings(txt)
+            text = (
+                f"<b>Quick Check</b>\n"
+                f"• Address: <code>{escape_html(txt[:6] + '...' + txt[-4:])}</code>\n\n"
+                f"<b>Wallet Balance</b>\n"
+                f"• SOL: <b>{escape_html(f'{sol_val:.6f}')}</b>\n\n"
+                f"<b>Tokens & NFTs</b>\n{tokens_text}"
+            )
+            bot.send_message(msg.chat.id, text, reply_markup=main_menu_keyboard(), disable_web_page_preview=True)
+        else:
+            bot.reply_to(msg, "Invalid Solana address. Send 44-char base58.")
+        user_states.pop(uid, None)
+        return
+
+    if state == "get_history":
+        if is_valid_solana_address(txt):
+            bot.send_chat_action(msg.chat.id, 'typing')
+            history_text = get_history_text(txt, limit=20)
+            bot.send_message(msg.chat.id, f"Full history for <code>{escape_html(txt[:6] + '...' + txt[-4:])}</code>:\n\n{history_text}", reply_markup=main_menu_keyboard(), disable_web_page_preview=True)
+        else:
+            bot.reply_to(msg, "Invalid Solana address. Send 44-char base58.")
+        user_states.pop(uid, None)
+        return
+
+    # If user just pasted a wallet in a normal chat (no state), treat as quick check
+    if is_valid_solana_address(txt):
+        sol_bal = rpc_post("getBalance", [txt])
+        sol_val = sol_bal["value"] / 1e9 if isinstance(sol_bal, dict) and "value" in sol_bal else 0.0
+        tokens_text = get_token_holdings(txt)
+        text = (
+            f"<b>Quick check</b>\n"
+            f"• Address: <code>{escape_html(txt[:6] + '...' + txt[-4:])}</code>\n\n"
+            f"<b>Wallet Balance</b>\n"
+            f"• SOL: <b>{escape_html(f'{sol_val:.6f}')}</b>\n\n"
+            f"<b>Tokens & NFTs</b>\n{tokens_text}"
+        )
+        bot.send_message(msg.chat.id, text, reply_markup=main_menu_keyboard(), disable_web_page_preview=True)
+        return
+
+# ========================= Token holdings helper (unchanged logic) =========================
+def get_token_holdings(addr: str) -> str:
+    res = rpc_post("getTokenAccountsByOwner", [addr, {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"}, {"encoding": "jsonParsed"}])
+    if not res or not res.get("value"):
+        return "No SPL tokens found"
+
+    text_lines = []
+    for acc in res["value"]:
+        info = acc["account"]["data"]["parsed"]["info"]
+        mint = info.get("mint", "")
+        amount = info.get("tokenAmount", {}).get("uiAmountString") or "0"
+        try:
+            if float(amount) > 0.001:  # ignore dust
+                sym = resolve_token_symbol(mint)
+                text_lines.append(f"• <code>{escape_html(sym)}</code>: <b>{escape_html(amount)}</b>")
+        except Exception:
+            continue
+    return "\n".join(text_lines) if text_lines else "No SPL tokens found"
+
+# ========================= Run =========================
+if __name__ == "__main__":
+    logging.info("Bot running • Detects all token & SOL transfers • Token symbol caching enabled")
+    threading.Thread(target=watcher_thread, daemon=True).start()
+    bot.infinity_polling()
